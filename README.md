@@ -25,7 +25,7 @@ All values are measured on your server at request time:
 | Endpoint | Data |
 |---|---|
 | `health` | status, PHP and Laravel versions, memory, load |
-| `performance` | memory, CPU load per core, disk space, OPcache |
+| `performance` | memory, CPU load per core, disk space, traffic sent since the server restarted, OPcache |
 | `seo` | homepage title, meta description, H1, image alt text, `lang`, canonical, links |
 | `security` | HTTPS, supported PHP, `APP_DEBUG` off, `display_errors`/`expose_php`, security headers |
 | `packages` | Composer dependencies with installed versions (from `composer.lock`) |
