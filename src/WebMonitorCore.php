@@ -114,6 +114,7 @@ class WebMonitorCore
         $memory = $this->memoryStats();
         $cpu = $this->cpuUsagePercent();
         $disk = $this->diskStats();
+        $traffic = $this->trafficStats();
         $responseTime = round((microtime(true) - $start) * 1000, 2);
 
         $score = 100;
@@ -143,6 +144,10 @@ class WebMonitorCore
             'memory_peak' => round(memory_get_peak_usage(true) / 1048576, 2),
             'cpu_usage' => $cpu,
             'disk_free_percent' => $disk['free_percent'],
+            'disk_free_bytes' => $disk['free_bytes'],
+            'disk_total_bytes' => $disk['total_bytes'],
+            'bandwidth_tx_bytes' => $traffic['tx_bytes'],
+            'bandwidth_rx_bytes' => $traffic['rx_bytes'],
             'opcache_enabled' => $this->opcacheEnabled(),
             'performance_score' => max(0, $score),
             'active_plugins' => null,
@@ -367,7 +372,48 @@ class WebMonitorCore
         $base = $this->options['basePath'];
         $free = @disk_free_space($base);
         $total = @disk_total_space($base);
-        return ['free_percent' => ($free && $total) ? round($free / $total * 100, 1) : null];
+        if ($free === false || $total === false || $total <= 0) {
+            return ['free_bytes' => null, 'total_bytes' => null, 'free_percent' => null];
+        }
+        return [
+            'free_bytes' => (int) $free,
+            'total_bytes' => (int) $total,
+            'free_percent' => round($free / $total * 100, 1),
+        ];
+    }
+
+    // Bytes sent and received on real interfaces since the server last booted.
+    // This is not the hosting plan's monthly quota, which PHP cannot read.
+    private function trafficStats(): array
+    {
+        $empty = ['tx_bytes' => null, 'rx_bytes' => null];
+        if (!is_readable('/proc/net/dev')) {
+            return $empty;
+        }
+        $lines = file('/proc/net/dev', FILE_IGNORE_NEW_LINES);
+        if ($lines === false) {
+            return $empty;
+        }
+        $tx = 0;
+        $rx = 0;
+        $found = false;
+        foreach ($lines as $line) {
+            if (!str_contains($line, ':')) {
+                continue;
+            }
+            [$iface, $rest] = explode(':', $line, 2);
+            if (trim($iface) === '' || trim($iface) === 'lo') {
+                continue;
+            }
+            $cols = preg_split('/\s+/', trim($rest));
+            if (!is_array($cols) || count($cols) < 9) {
+                continue;
+            }
+            $rx += (int) $cols[0];
+            $tx += (int) $cols[8];
+            $found = true;
+        }
+        return $found ? ['tx_bytes' => $tx, 'rx_bytes' => $rx] : $empty;
     }
 
     private function systemUptimeSeconds(): ?int
