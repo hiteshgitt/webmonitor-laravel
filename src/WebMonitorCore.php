@@ -13,7 +13,7 @@ namespace Ruyalab\WebMonitor;
 
 class WebMonitorCore
 {
-    public const VERSION = '1.0.0';
+    public const VERSION = '1.1.0';
     public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations'];
 
     /** @var array{apiKey: string, framework: string, frameworkVersion: string, basePath: string, debug: ?bool, siteUrl: ?string, logPaths: string[]} */
@@ -22,7 +22,8 @@ class WebMonitorCore
 
     /**
      * @param array $options apiKey, framework, frameworkVersion, basePath (project root),
-     *                       debug (framework debug mode, null if unknown), siteUrl, logPaths
+     *                       debug (framework debug mode, null if unknown), siteUrl, logPaths,
+     *                       components (callable returning framework checks, see component())
      */
     public function __construct(array $options)
     {
@@ -34,7 +35,100 @@ class WebMonitorCore
             'debug' => null,
             'siteUrl' => null,
             'logPaths' => [],
+            'components' => null,
         ];
+    }
+
+    /**
+     * One health component, the shared format of every integration: Web Monitor shows it, alerts when it
+     * fails and says what to do. status: ok | warning | error | unknown.
+     */
+    public static function component(string $id, string $name, string $status, string $message, ?string $hint = null): array
+    {
+        return array_filter([
+            'id' => $id, 'name' => $name, 'status' => $status,
+            'message' => mb_substr($message, 0, 200), 'hint' => $hint === null ? null : mb_substr($hint, 0, 240),
+        ], fn ($v) => $v !== null);
+    }
+
+    /** Runs a check; a check that throws reports an error instead of breaking the health endpoint. */
+    public static function guard(string $id, string $name, callable $check, ?string $hint = null): array
+    {
+        try {
+            return $check();
+        } catch (\Throwable $e) {
+            return self::component($id, $name, 'error', $e->getMessage(), $hint);
+        }
+    }
+
+    /** Checks every PHP site has: memory, disk and recent fatal errors in the log. */
+    private function baseComponents(): array
+    {
+        $out = [];
+        $memory = $this->memoryStats()['usage_percent'];
+        if ($memory !== null) {
+            $out[] = self::component('php_memory', 'PHP memory', $memory >= 95 ? 'error' : ($memory >= 80 ? 'warning' : 'ok'),
+                "Using {$memory}% of memory_limit (" . ini_get('memory_limit') . ').',
+                $memory >= 80 ? 'Raise memory_limit or find the request that uses so much memory.' : null);
+        }
+        $disk = $this->diskStats();
+        if ($disk['free_percent'] !== null) {
+            $free = $disk['free_percent'];
+            $out[] = self::component('disk', 'Disk space', $free < 5 ? 'error' : ($free < 15 ? 'warning' : 'ok'),
+                "{$free}% free (" . round($disk['free_bytes'] / 1073741824, 1) . ' GB).',
+                $free < 15 ? 'Free space: old backups, logs and cache folders are the usual culprits.' : null);
+        }
+        $fatal = $this->recentFatalErrors();
+        if ($fatal !== null) {
+            $out[] = $fatal['count'] === 0
+                ? self::component('php_errors', 'PHP errors', 'ok', 'No fatal errors in the log in the last hour.')
+                : self::component('php_errors', 'PHP errors', 'warning',
+                    "{$fatal['count']} fatal error" . ($fatal['count'] === 1 ? '' : 's') . " in the last hour. Latest: {$fatal['last']}",
+                    'Open the application log for the full stack trace.');
+        }
+        return $out;
+    }
+
+    /** Fatal errors logged in the last hour (Laravel, CodeIgniter and PHP log formats), or null without a log. */
+    private function recentFatalErrors(): ?array
+    {
+        foreach ($this->options['logPaths'] as $path) {
+            if (!$path || !is_file($path) || !is_readable($path)) {
+                continue;
+            }
+            $since = time() - 3600;
+            $count = 0;
+            $last = '';
+            foreach ($this->tail($path, 400) as $line) {
+                if (!preg_match('/(production|local|staging)\.(ERROR|CRITICAL|EMERGENCY|ALERT)|^(CRITICAL|ERROR|EMERGENCY) - |PHP Fatal error|Uncaught /', $line)) {
+                    continue;
+                }
+                if (preg_match('/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/', substr($line, 0, 60), $m)) {
+                    $at = strtotime($m[1] . ' ' . $m[2]);
+                    if ($at !== false && $at < $since) {
+                        continue;
+                    }
+                }
+                $count++;
+                $last = trim(preg_replace('/^\[[^\]]+\]\s*/', '', $line));
+            }
+            return ['count' => $count, 'last' => mb_substr($last, 0, 140)];
+        }
+        return null;
+    }
+
+    /** Base checks plus the framework's own (database, queue, scheduler...). */
+    public function getComponents(): array
+    {
+        $components = $this->baseComponents();
+        if (is_callable($this->options['components'])) {
+            foreach ((array) ($this->options['components'])() as $c) {
+                if (is_array($c) && isset($c['id'], $c['status'])) {
+                    $components[] = $c;
+                }
+            }
+        }
+        return $components;
     }
 
     /**
@@ -69,11 +163,18 @@ class WebMonitorCore
     {
         $start = microtime(true);
         $memory = $this->memoryStats();
+        $components = $this->getComponents();
         $status = 'healthy';
         $message = 'Site is healthy';
-        if ($memory['usage_percent'] !== null && $memory['usage_percent'] >= 90) {
-            $status = 'warning';
-            $message = 'PHP memory usage is above 90% of memory_limit';
+        // The site answered, so a failing component makes it "needs attention" rather than down.
+        foreach (['error', 'warning'] as $level) {
+            foreach ($components as $c) {
+                if ($c['status'] === $level) {
+                    $status = 'warning';
+                    $message = $c['name'] . ': ' . $c['message'];
+                    break 2;
+                }
+            }
         }
         return [
             'status' => $status,
@@ -90,6 +191,7 @@ class WebMonitorCore
                 'memory_limit' => ini_get('memory_limit'),
                 'load_average' => $this->loadAverage(),
             ],
+            'components' => $components,
         ];
     }
 

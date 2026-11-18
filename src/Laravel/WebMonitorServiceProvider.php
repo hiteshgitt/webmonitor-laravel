@@ -2,6 +2,8 @@
 
 namespace Ruyalab\WebMonitor\Laravel;
 
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 
@@ -22,6 +24,17 @@ class WebMonitorServiceProvider extends ServiceProvider
         Route::get('api/webmonitor/{endpoint}', [WebMonitorController::class, 'handle'])
             ->where('endpoint', '[a-z]+')
             ->name('webmonitor');
+
+        // Heartbeats for the scheduler and queue checks (see LaravelHealth): every minute the scheduler stamps
+        // the cache and queues a tiny job; the job stamps it again when a worker runs it.
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
+            $schedule->call(function () {
+                Cache::forever(LaravelHealth::SCHEDULER_KEY, time());
+                if (!in_array(config('queue.default'), ['sync', null], true)) {
+                    dispatch(new HeartbeatJob());
+                }
+            })->everyMinute()->name('webmonitor:heartbeat')->withoutOverlapping();
+        });
 
         if ($this->app->runningInConsole()) {
             $this->commands([InstallCommand::class]);
