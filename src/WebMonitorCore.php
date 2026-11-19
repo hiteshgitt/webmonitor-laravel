@@ -13,7 +13,7 @@ namespace Ruyalab\WebMonitor;
 
 class WebMonitorCore
 {
-    public const VERSION = '1.1.0';
+    public const VERSION = '1.2.0';
     public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations'];
 
     /** @var array{apiKey: string, framework: string, frameworkVersion: string, basePath: string, debug: ?bool, siteUrl: ?string, logPaths: string[]} */
@@ -185,6 +185,7 @@ class WebMonitorCore
             'framework' => $this->options['framework'],
             'framework_version' => $this->options['frameworkVersion'],
             'integration_version' => self::VERSION,
+            'security_config' => self::securityConfig(),
             'uptime_seconds' => $this->systemUptimeSeconds(),
             'checks' => [
                 'memory_usage' => $memory['usage_percent'] === null ? null : $memory['usage_percent'] . '%',
@@ -516,6 +517,24 @@ class WebMonitorCore
             $found = true;
         }
         return $found ? ['tx_bytes' => $tx, 'rx_bytes' => $rx] : $empty;
+    }
+
+    /**
+     * PHP settings that decide whether some vulnerabilities apply (WebMonitor's Release Radar uses them to say
+     * "exposed" or "not exposed"). Values only, never paths or secrets.
+     */
+    public static function securityConfig(): array
+    {
+        $on = static function ($v): bool {
+            return in_array(strtolower(trim((string) $v)), ['1', 'on', 'true', 'yes'], true);
+        };
+        return [
+            'session.upload_progress.enabled' => $on(ini_get('session.upload_progress.enabled')),
+            'session.serialize_handler' => substr((string) ini_get('session.serialize_handler'), 0, 40),
+            'expose_php' => $on(ini_get('expose_php')),
+            'display_errors' => $on(ini_get('display_errors')),
+            'allow_url_include' => $on(ini_get('allow_url_include')),
+        ];
     }
 
     private function systemUptimeSeconds(): ?int
