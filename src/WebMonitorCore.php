@@ -13,8 +13,8 @@ namespace Ruyalab\WebMonitor;
 
 class WebMonitorCore
 {
-    public const VERSION = '1.2.0';
-    public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations'];
+    public const VERSION = '1.3.0';
+    public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations', 'errors'];
 
     /** @var array{apiKey: string, framework: string, frameworkVersion: string, basePath: string, debug: ?bool, siteUrl: ?string, logPaths: string[]} */
     private array $options;
@@ -159,6 +159,13 @@ class WebMonitorCore
         }
     }
 
+    /** Grouped errors (fatal errors and uncaught exceptions) recorded by ErrorTracker. */
+    public function getErrors(): array
+    {
+        $summary = ErrorTracker::summary();
+        return ['tracked' => $summary['tracked'], 'summary' => $summary, 'groups' => ErrorTracker::groups()];
+    }
+
     public function getHealth(): array
     {
         $start = microtime(true);
@@ -186,6 +193,7 @@ class WebMonitorCore
             'framework_version' => $this->options['frameworkVersion'],
             'integration_version' => self::VERSION,
             'security_config' => self::securityConfig(),
+            'errors' => ErrorTracker::summary(),
             'uptime_seconds' => $this->systemUptimeSeconds(),
             'checks' => [
                 'memory_usage' => $memory['usage_percent'] === null ? null : $memory['usage_percent'] . '%',
@@ -648,5 +656,188 @@ class WebMonitorCore
             case 'k': return $number * 1024;
             default: return $number;
         }
+    }
+}
+
+/**
+ * Error tracking for Web Monitor (1.3.0): fatal errors and uncaught exceptions, grouped by fingerprint
+ * (type + file + line + message shape), with the top stack frames. Installed with ErrorTracker::install():
+ * it only adds a shutdown function, so the site's own error handling and error pages are unchanged.
+ * Frameworks that catch exceptions call ErrorTracker::recordThrowable() from their report hook.
+ * Stored in one small JSON file (at most 100 groups); messages are cleaned of emails, tokens and passwords.
+ */
+final class ErrorTracker
+{
+    private const MAX_GROUPS = 100;
+    private const FATAL = E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR;
+    private static bool $installed = false;
+    private static ?string $file = null;
+    private static string $base = '';
+
+    public static function install(?string $storeFile = null, ?string $basePath = null): void
+    {
+        self::configure($storeFile, $basePath);
+        if (self::$installed) {
+            return;
+        }
+        self::$installed = true;
+        register_shutdown_function(static function (): void {
+            $e = error_get_last();
+            if ($e && ($e['type'] & self::FATAL)) {
+                [$message, $trace] = self::splitUncaught((string) $e['message']);
+                self::record(self::typeName((int) $e['type'], $message), $message, (string) $e['file'], (int) $e['line'], $trace);
+            }
+        });
+    }
+
+    public static function configure(?string $storeFile = null, ?string $basePath = null): void
+    {
+        self::$file = $storeFile ?: rtrim(sys_get_temp_dir(), '/\\') . '/webmonitor-errors-' . substr(sha1(__DIR__), 0, 12) . '.json';
+        self::$base = rtrim((string) ($basePath ?: ($_SERVER['DOCUMENT_ROOT'] ?? getcwd() ?: '')), '/\\');
+    }
+
+    public static function recordThrowable(\Throwable $t): void
+    {
+        if (self::$file === null) {
+            self::configure();
+        }
+        $frames = [];
+        foreach (array_slice($t->getTrace(), 0, 10) as $f) {
+            $frames[] = self::rel((string) ($f['file'] ?? '[internal]')) . ':' . ($f['line'] ?? 0) . ' ' . ($f['class'] ?? '') . ($f['type'] ?? '') . ($f['function'] ?? '');
+        }
+        self::record(get_class($t), $t->getMessage(), $t->getFile(), $t->getLine(), $frames);
+    }
+
+    public static function record(string $type, string $message, string $file, int $line, array $trace = []): void
+    {
+        try {
+            $path = self::$file ?? '';
+            if ($path === '') {
+                return;
+            }
+            $fh = @fopen($path, 'c+');
+            if (!$fh) {
+                return;
+            }
+            if (!flock($fh, LOCK_EX)) {
+                fclose($fh);
+                return;
+            }
+            $raw = stream_get_contents($fh);
+            $data = json_decode($raw ?: '{}', true) ?: [];
+            $groups = $data['groups'] ?? [];
+            $minutes = $data['minutes'] ?? [];
+            $now = time();
+            $clean = self::clean($message);
+            $rel = self::rel($file);
+            $shape = preg_replace(['/\d+/', "/'[^']*'|\"[^\"]*\"/"], ['N', 'S'], $clean);
+            $fp = substr(sha1($type . '|' . $rel . '|' . $line . '|' . $shape), 0, 16);
+            $where = substr(strtok((string) ($_SERVER['REQUEST_URI'] ?? (PHP_SAPI === 'cli' ? 'cli' : '')), '?') ?: '', 0, 120);
+            $g = $groups[$fp] ?? ['fp' => $fp, 'type' => substr($type, 0, 80), 'message' => substr($clean, 0, 300), 'file' => $rel, 'line' => $line,
+                'where' => $where, 'stack' => array_map([self::class, 'clean'], array_slice($trace, 0, 10)), 'count' => 0, 'first_seen' => $now];
+            $g['count']++;
+            $g['last_seen'] = $now;
+            $g['where'] = $where ?: $g['where'];
+            $groups[$fp] = $g;
+            if (count($groups) > self::MAX_GROUPS) {
+                uasort($groups, static fn($a, $b) => $b['last_seen'] <=> $a['last_seen']);
+                $groups = array_slice($groups, 0, self::MAX_GROUPS, true);
+            }
+            $minute = (string) intdiv($now, 60);
+            $minutes[$minute] = ($minutes[$minute] ?? 0) + 1;
+            $minutes = array_filter($minutes, static fn($k) => (int) $k > intdiv($now, 60) - 60, ARRAY_FILTER_USE_KEY);
+            ftruncate($fh, 0);
+            rewind($fh);
+            fwrite($fh, json_encode(['groups' => $groups, 'minutes' => $minutes], JSON_UNESCAPED_SLASHES));
+            fflush($fh);
+            flock($fh, LOCK_UN);
+            fclose($fh);
+        } catch (\Throwable $ignored) {
+            // Error tracking must never break the site.
+        }
+    }
+
+    /** The small summary that goes into every health response. */
+    public static function summary(): array
+    {
+        $data = self::load();
+        if ($data === null) {
+            return ['tracked' => self::$installed, 'groups' => 0, 'last_5m' => 0, 'last_hour' => 0, 'latest' => null];
+        }
+        $now = intdiv(time(), 60);
+        $last5 = 0;
+        $hour = 0;
+        foreach ($data['minutes'] ?? [] as $m => $n) {
+            if ((int) $m > $now - 60) $hour += $n;
+            if ((int) $m > $now - 5) $last5 += $n;
+        }
+        $latest = 0;
+        foreach ($data['groups'] ?? [] as $g) $latest = max($latest, (int) ($g['last_seen'] ?? 0));
+        return ['tracked' => true, 'groups' => count($data['groups'] ?? []), 'last_5m' => $last5, 'last_hour' => $hour, 'latest' => $latest ? gmdate('c', $latest) : null];
+    }
+
+    /** Every group, newest first, for the errors endpoint. */
+    public static function groups(): array
+    {
+        $groups = array_values((self::load() ?? [])['groups'] ?? []);
+        usort($groups, static fn($a, $b) => ($b['last_seen'] ?? 0) <=> ($a['last_seen'] ?? 0));
+        return array_map(static function ($g) {
+            $g['first_seen'] = gmdate('c', (int) $g['first_seen']);
+            $g['last_seen'] = gmdate('c', (int) $g['last_seen']);
+            return $g;
+        }, $groups);
+    }
+
+    private static function load(): ?array
+    {
+        if (self::$file === null) {
+            self::configure();
+        }
+        if (!is_file(self::$file)) {
+            return null;
+        }
+        $data = json_decode((string) @file_get_contents(self::$file), true);
+        return is_array($data) ? $data : null;
+    }
+
+    private static function rel(string $file): string
+    {
+        if (self::$base !== '' && strpos($file, self::$base) === 0) {
+            $file = ltrim(substr($file, strlen(self::$base)), '/\\');
+        }
+        return substr($file, -200);
+    }
+
+    /** Emails, long tokens, passwords and query strings out of anything stored. */
+    public static function clean(string $s): string
+    {
+        $s = preg_replace('/[\w.+-]+@[\w-]+\.[\w.-]+/', '[email]', $s);
+        $s = preg_replace('/(pass(word)?|pwd|secret|token|api[_-]?key|authorization)(["\']?\s*[:=]\s*)[^\s,;&"\']+/i', '$1$3[redacted]', $s);
+        $s = preg_replace('/\b[A-Za-z0-9_\-]{32,}\b/', '[token]', $s);
+        return (string) $s;
+    }
+
+    /** "Uncaught X: msg in file:line\nStack trace:\n#0 ..." → message and frames. */
+    private static function splitUncaught(string $message): array
+    {
+        $parts = preg_split('/\nStack trace:\n/', $message, 2);
+        $frames = [];
+        if (isset($parts[1])) {
+            foreach (array_slice(explode("\n", $parts[1]), 0, 11) as $line) {
+                if (strpos(trim($line), 'thrown') === 0) continue;
+                $frames[] = self::rel(preg_replace('/^#\d+\s+/', '', trim($line)));
+            }
+        }
+        $msg = preg_replace('/ in [^\n]+:\d+$/', '', trim($parts[0]));
+        return [preg_replace('/^(?:PHP )?Uncaught [\w\\\\]+: /', '', $msg), $frames];
+    }
+
+    private static function typeName(int $type, string $message): string
+    {
+        if (preg_match('/^(?:PHP )?Uncaught ([\w\\\\]+)/', $message, $m)) {
+            return $m[1];
+        }
+        return [E_ERROR => 'Fatal error', E_PARSE => 'Parse error', E_CORE_ERROR => 'Core error', E_COMPILE_ERROR => 'Compile error',
+            E_USER_ERROR => 'User error', E_RECOVERABLE_ERROR => 'Recoverable error'][$type] ?? 'Error';
     }
 }
