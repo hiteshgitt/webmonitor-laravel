@@ -19,6 +19,8 @@ class WebMonitorController extends Controller
             'debug' => (bool) config('app.debug'),
             'siteUrl' => config('webmonitor.site_url') ?: $request->getSchemeAndHttpHost(),
             'logPaths' => [storage_path('logs/laravel.log'), storage_path('logs/laravel-' . date('Y-m-d') . '.log')],
+            // Only the health endpoint runs the framework checks (database, cache, scheduler, queue...).
+            'components' => $endpoint === 'health' ? [LaravelHealth::class, 'components'] : null,
         ]);
 
         // Laravel calls the "packages" list for PHP frameworks; keep both names working
