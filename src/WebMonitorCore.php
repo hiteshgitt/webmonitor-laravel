@@ -13,7 +13,7 @@ namespace Ruyalab\WebMonitor;
 
 class WebMonitorCore
 {
-    public const VERSION = '1.4.0';
+    public const VERSION = '1.5.0';
     public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations', 'errors', 'filescan'];
 
     /** @var array{apiKey: string, framework: string, frameworkVersion: string, basePath: string, debug: ?bool, siteUrl: ?string, logPaths: string[]} */
@@ -77,6 +77,13 @@ class WebMonitorCore
             $out[] = self::component('disk', 'Disk space', $free < 5 ? 'error' : ($free < 15 ? 'warning' : 'ok'),
                 "{$free}% free (" . round($disk['free_bytes'] / 1073741824, 1) . ' GB).',
                 $free < 15 ? 'Free space: old backups, logs and cache folders are the usual culprits.' : null);
+        }
+        $inodes = $this->inodeStats();
+        if ($inodes['used_percent'] !== null) {
+            $used = $inodes['used_percent'];
+            $out[] = self::component('inodes', 'Inodes (file count)', $used >= 95 ? 'error' : ($used >= 85 ? 'warning' : 'ok'),
+                "{$used}% of inodes used (" . number_format($inodes['used']) . ' of ' . number_format($inodes['total']) . ').',
+                $used >= 85 ? 'Too many small files: clear cache and session folders, old backups and mail queues.' : null);
         }
         $fatal = $this->recentFatalErrors();
         if ($fatal !== null) {
@@ -232,6 +239,7 @@ class WebMonitorCore
         $memory = $this->memoryStats();
         $cpu = $this->cpuUsagePercent();
         $disk = $this->diskStats();
+        $inodes = $this->inodeStats();
         $traffic = $this->trafficStats();
         $responseTime = round((microtime(true) - $start) * 1000, 2);
 
@@ -264,6 +272,8 @@ class WebMonitorCore
             'disk_free_percent' => $disk['free_percent'],
             'disk_free_bytes' => $disk['free_bytes'],
             'disk_total_bytes' => $disk['total_bytes'],
+            'inodes_used_percent' => $inodes['used_percent'],
+            'inodes_total' => $inodes['total'],
             'bandwidth_tx_bytes' => $traffic['tx_bytes'],
             'bandwidth_rx_bytes' => $traffic['rx_bytes'],
             'opcache_enabled' => $this->opcacheEnabled(),
@@ -483,6 +493,25 @@ class WebMonitorCore
             $cores = max(1, substr_count((string) file_get_contents('/proc/cpuinfo'), "\nprocessor") + 1);
         }
         return round(min(100, $load / $cores * 100), 2);
+    }
+
+    /**
+     * Inode use of the filesystem holding the site. PHP has no native call for it, so `df -Pi` is used where the host
+     * allows shell commands; otherwise nothing is reported (never a guess).
+     */
+    private function inodeStats(): array
+    {
+        $none = ['used_percent' => null, 'used' => null, 'total' => null];
+        if (!function_exists('shell_exec') || in_array('shell_exec', array_map('trim', explode(',', (string) ini_get('disable_functions'))), true)) {
+            return $none;
+        }
+        $out = @shell_exec('df -Pi ' . escapeshellarg((string) $this->options['basePath']) . ' 2>/dev/null');
+        if (!is_string($out) || !preg_match('/\n\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%/', $out, $m) || (int) $m[1] === 0) {
+            return $none;
+        }
+        $total = (int) $m[1];
+        $used = (int) $m[2];
+        return ['used_percent' => round($used / $total * 100, 1), 'used' => $used, 'total' => $total];
     }
 
     private function diskStats(): array
