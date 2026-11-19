@@ -13,8 +13,8 @@ namespace Ruyalab\WebMonitor;
 
 class WebMonitorCore
 {
-    public const VERSION = '1.3.0';
-    public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations', 'errors'];
+    public const VERSION = '1.4.0';
+    public const ENDPOINTS = ['health', 'analytics', 'performance', 'seo', 'security', 'packages', 'logs', 'recommendations', 'errors', 'filescan'];
 
     /** @var array{apiKey: string, framework: string, frameworkVersion: string, basePath: string, debug: ?bool, siteUrl: ?string, logPaths: string[]} */
     private array $options;
@@ -157,6 +157,13 @@ class WebMonitorCore
         } catch (\Throwable $e) {
             return [500, ['error' => 'Web Monitor check failed: ' . $e->getMessage()]];
         }
+    }
+
+    /** One batch of the suspicious-file scan over the site's base path (read-only). */
+    public function getFilescan(): array
+    {
+        @set_time_limit(30);
+        return (new FileScanner((string) $this->options['basePath']))->step();
     }
 
     /** Grouped errors (fatal errors and uncaught exceptions) recorded by ErrorTracker. */
@@ -839,5 +846,218 @@ final class ErrorTracker
         }
         return [E_ERROR => 'Fatal error', E_PARSE => 'Parse error', E_CORE_ERROR => 'Core error', E_COMPILE_ERROR => 'Compile error',
             E_USER_ERROR => 'User error', E_RECOVERABLE_ERROR => 'Recoverable error'][$type] ?? 'Error';
+    }
+}
+
+/**
+ * Suspicious-file scan for Web Monitor (1.4.0). Read-only: files are read, never executed, changed or deleted.
+ * Finds PHP where uploads belong, known backdoor / web-shell code, request input reaching eval / shell functions,
+ * heavy obfuscation, and injected JavaScript loaders, each with file, line, rule and a short snippet.
+ * Works in small batches (time and file budget per call) and remembers where it stopped; a full pass then starts
+ * again, skipping files whose size and modification time did not change. State lives in one JSON file.
+ */
+final class FileScanner
+{
+    private const MAX_FILE_BYTES = 2000000;
+    private const MAX_FINDINGS = 200;
+    private const SKIP_DIRS = ['.git', 'node_modules', 'vendor', 'cache', '.cache', 'storage/framework', 'wp-content/upgrade', 'wp-content/cache', 'wp-content/backups', 'wp-content/updraft'];
+    private const PHP_EXT = ['php', 'phtml', 'php3', 'php4', 'php5', 'php7', 'php8', 'phar', 'inc', 'pht'];
+    private const JS_EXT = ['js', 'html', 'htm'];
+    // Upload folders, from the site root only (a plugin's own files/ or images/ folder is not an uploads folder).
+    private const UPLOAD_DIRS = ['wp-content/uploads', 'uploads', 'storage/app/public', 'public/storage', 'public/uploads', 'writable/uploads'];
+
+    /** [id, severity, title, PHP regex] — tested per line. */
+    private const RULES = [
+        ['eval-decode', 'critical', 'eval() of decoded or compressed data (typical injected backdoor)', '/\b(eval|assert)\s*\(\s*(@?\s*)?(base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|strrev|rawurldecode|hex2bin|convert_uudecode)\s*\(/i'],
+        ['request-exec', 'critical', 'Request input passed to code or shell execution', '/\b(eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec|create_function)\s*\(\s*[^;]{0,80}\$_(GET|POST|REQUEST|COOKIE|SERVER\[\s*[\'"]HTTP_)/i'],
+        ['request-callable', 'critical', 'Function name taken from request input (remote code execution)', '/\$_(GET|POST|REQUEST|COOKIE)\s*\[[^\]]{1,40}\]\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/i'],
+        ['preg-e', 'critical', 'preg_replace with the /e modifier (executes the replacement)', '/preg_replace\s*\(\s*[\'"](.).*\1[a-z]*e[a-z]*[\'"]\s*,/i'],
+        ['webshell-sig', 'critical', 'Known web-shell signature', '/(FilesMan|WSO\s*[0-9.]+|c99sh(ell)?|r57shell|b374k|IndoXploit|Alfa\s*Shell|AnonymousFox|Mini\s*Shell|uname\s+-a.{0,40}passthru)/i'],
+        ['write-php-from-request', 'high', 'Writes a .php file from request input (dropper)', '/(file_put_contents|fwrite|fputs)\s*\([^;]{0,120}\.php[\'"][^;]{0,120}\$_(GET|POST|REQUEST|FILES)/i'],
+        ['hex-eval', 'high', 'Hex- or chr()-encoded eval / assert', '/(\\\\x65\\\\x76\\\\x61\\\\x6c|chr\s*\(\s*101\s*\)\s*\.\s*chr\s*\(\s*118\s*\)|"\\\\x61\\\\x73\\\\x73\\\\x65\\\\x72\\\\x74")/i'],
+        ['remote-include', 'high', 'Includes code from a URL or request input', '/\b(include|require)(_once)?\s*\(?\s*([\'"]https?:\/\/|\$_(GET|POST|REQUEST|COOKIE))/i'],
+    ];
+    private const JS_RULES = [
+        ['js-injected-loader', 'high', 'Injected JavaScript loader (decoded and executed at runtime)', '/(eval\s*\(\s*(String\.fromCharCode|atob|unescape)\s*\(|document\.write\s*\(\s*unescape\s*\(|new\s+Function\s*\(\s*atob\s*\()/i'],
+    ];
+
+    private string $base;
+    private string $state;
+
+    public function __construct(string $basePath, ?string $stateFile = null)
+    {
+        $this->base = rtrim($basePath, '/\\');
+        $this->state = $stateFile ?: rtrim(sys_get_temp_dir(), '/\\') . '/webmonitor-filescan-' . substr(sha1($this->base), 0, 12) . '.json';
+    }
+
+    /** One batch: scans up to $maxFiles files or $seconds of work, then returns progress and every open finding. */
+    public function step(int $maxFiles = 400, float $seconds = 3.0): array
+    {
+        $start = microtime(true);
+        $s = $this->load();
+        $cursor = (int) ($s['cursor'] ?? 0);
+        if ($cursor === 0) {
+            $s['cycle_started'] = time();
+            $s['seen'] = [];
+            $s['pending'] = [];
+        }
+        $seenThisCycle = $s['seen'] ?? [];
+        $index = 0;
+        $scanned = 0;
+        $done = true;
+        foreach ($this->walk() as $rel => $info) {
+            if ($index++ < $cursor) {
+                continue;
+            }
+            if ($scanned >= $maxFiles || (microtime(true) - $start) > $seconds) {
+                $done = false;
+                $index--;
+                break;
+            }
+            $scanned++;
+            $sig = $info['size'] . ':' . $info['mtime'];
+            $seenThisCycle[$rel] = 1;
+            if (($s['files'][$rel] ?? null) === $sig) {
+                continue; // unchanged since the last full pass: its findings (if any) still stand
+            }
+            $s['files'][$rel] = $sig;
+            foreach (array_keys($s['findings'] ?? []) as $id) {
+                if (($s['findings'][$id]['path'] ?? '') === $rel) unset($s['findings'][$id]);
+            }
+            foreach ($this->scanFile($rel, $info) as $f) {
+                if (count($s['findings'] ?? []) < self::MAX_FINDINGS) $s['findings'][$f['id']] = $f;
+            }
+        }
+        $s['seen'] = $seenThisCycle;
+        $s['cursor'] = $done ? 0 : $index;
+        if ($done) {
+            // Files that disappeared during the pass are forgotten, with their findings.
+            foreach (array_keys($s['files'] ?? []) as $rel) {
+                if (!isset($seenThisCycle[$rel])) {
+                    unset($s['files'][$rel]);
+                    foreach (array_keys($s['findings'] ?? []) as $id) if (($s['findings'][$id]['path'] ?? '') === $rel) unset($s['findings'][$id]);
+                }
+            }
+            $s['cycle_completed'] = time();
+            $s['files_total'] = count($seenThisCycle);
+            $s['seen'] = [];
+        }
+        $this->save($s);
+        return [
+            'scanner' => 'webmonitor-filescan/1',
+            'progress' => ['files_done' => $done ? count($seenThisCycle) : $index, 'files_total' => $s['files_total'] ?? null, 'cycle_complete' => $done,
+                'cycle_started' => isset($s['cycle_started']) ? gmdate('c', (int) $s['cycle_started']) : null,
+                'cycle_completed' => isset($s['cycle_completed']) ? gmdate('c', (int) $s['cycle_completed']) : null],
+            'findings' => array_values($s['findings'] ?? []),
+        ];
+    }
+
+    /** Relative path => size / mtime for every candidate file, in a stable order. */
+    private function walk(): \Generator
+    {
+        $self = realpath(__FILE__);
+        $stack = [''];
+        while ($stack) {
+            $dir = array_pop($stack);
+            $abs = $this->base . ($dir === '' ? '' : '/' . $dir);
+            $entries = @scandir($abs);
+            if ($entries === false) continue;
+            $subdirs = [];
+            foreach ($entries as $e) {
+                if ($e === '.' || $e === '..') continue;
+                $rel = $dir === '' ? $e : $dir . '/' . $e;
+                $path = $abs . '/' . $e;
+                if (is_link($path)) continue;
+                if (is_dir($path)) {
+                    if (!$this->skipDir($rel)) $subdirs[] = $rel;
+                    continue;
+                }
+                $ext = strtolower(pathinfo($e, PATHINFO_EXTENSION));
+                if (!in_array($ext, self::PHP_EXT, true) && !in_array($ext, self::JS_EXT, true)) continue;
+                // The scanner's own file contains the signatures it looks for: skip exactly that file (by real path).
+                if ($self !== false && realpath($path) === $self) continue;
+                $st = @stat($path);
+                if (!$st || $st['size'] > self::MAX_FILE_BYTES) continue;
+                yield $rel => ['size' => $st['size'], 'mtime' => $st['mtime'], 'ext' => $ext];
+            }
+            rsort($subdirs); // popped in ascending order
+            foreach ($subdirs as $d) $stack[] = $d;
+        }
+    }
+
+    private function skipDir(string $rel): bool
+    {
+        foreach (self::SKIP_DIRS as $skip) {
+            if ($rel === $skip || substr($rel, -strlen('/' . $skip)) === '/' . $skip) return true;
+        }
+        return false;
+    }
+
+    private function inUploads(string $rel): bool
+    {
+        foreach (self::UPLOAD_DIRS as $d) {
+            if (strpos($rel, $d . '/') === 0) return true;
+        }
+        return false;
+    }
+
+    /** Findings for one file. Pure apart from reading it. */
+    public function scanFile(string $rel, array $info): array
+    {
+        $out = [];
+        $isPhp = in_array($info['ext'], self::PHP_EXT, true);
+        $add = function (string $rule, string $sev, string $title, int $line, string $text) use (&$out, $rel, $info) {
+            $id = substr(sha1($rel . '|' . $rule . '|' . preg_replace('/\s+/', ' ', trim($text))), 0, 16);
+            $out[$id] = ['id' => $id, 'path' => $rel, 'line' => $line, 'rule' => $rule, 'severity' => $sev, 'title' => $title,
+                'snippet' => self::snippet($text), 'mtime' => gmdate('c', (int) $info['mtime']), 'size' => (int) $info['size']];
+        };
+        if ($isPhp && $this->inUploads($rel) && basename($rel) !== 'index.php') {
+            $add('php-in-uploads', 'critical', 'PHP file in an uploads folder (uploads should never contain code)', 1, (string) @file_get_contents($this->base . '/' . $rel, false, null, 0, 200));
+        }
+        $fh = @fopen($this->base . '/' . $rel, 'rb');
+        if (!$fh) return array_values($out);
+        $n = 0;
+        while (($line = fgets($fh, 1048576)) !== false) {
+            $n++;
+            $len = strlen($line);
+            if ($isPhp && $len > 5000 && preg_match('/(eval|assert|base64_decode|gzinflate|str_rot13|\$\w+\s*\(\s*\$\w+)/i', $line) && preg_match('/[A-Za-z0-9+\/=]{2000,}/', $line)) {
+                $add('obfuscated', 'high', 'Heavily obfuscated code (long encoded payload next to decode/exec calls)', $n, $line);
+            }
+            if ($len > 20000) continue; // minified / generated: only the obfuscation check above applies
+            foreach (self::matchLine($line, $isPhp) as [$id, $sev, $title]) $add($id, $sev, $title, $n, $line);
+            if (count($out) >= 20) break;
+        }
+        fclose($fh);
+        return array_values($out);
+    }
+
+    /** Rules matching one line: [[id, severity, title], ...]. Pure (used by scanFile and by tests). */
+    public static function matchLine(string $line, bool $php = true): array
+    {
+        $hits = [];
+        foreach ($php ? self::RULES : self::JS_RULES as [$id, $sev, $title, $re]) {
+            if (preg_match($re, $line)) $hits[] = [$id, $sev, $title];
+        }
+        return $hits;
+    }
+
+    /** At most 160 characters around the match, with keys, tokens and long payloads shortened. */
+    private static function snippet(string $text): string
+    {
+        $t = preg_replace('/[A-Za-z0-9+\/=]{60,}/', '[encoded payload]', trim($text));
+        $t = ErrorTracker::clean((string) $t);
+        return substr(preg_replace('/\s+/', ' ', (string) $t), 0, 160);
+    }
+
+    private function load(): array
+    {
+        $d = is_file($this->state) ? json_decode((string) @file_get_contents($this->state), true) : null;
+        return is_array($d) ? $d : [];
+    }
+
+    private function save(array $s): void
+    {
+        @file_put_contents($this->state, json_encode($s, JSON_UNESCAPED_SLASHES), LOCK_EX);
+        @chmod($this->state, 0600);
     }
 }
